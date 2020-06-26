@@ -1,52 +1,96 @@
 package main
 
 import (
+	"bytes"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"strings"
 )
+
+var startUrl = "http://test.youplace.net"
 
 func main() {
 	cookieJar, _ := cookiejar.New(nil)
 	client := &http.Client{
 		Jar: cookieJar,
 	}
-	res, _ := client.Get("http://test.youplace.net/")
-	urlSend := "http://test.youplace.net/question/1"
-	res, _ = client.Get(urlSend)
-	var body []byte
-	for ; res.StatusCode == 200; {
-		form := PageProcessor(res.Body)
-		log.Println(form)
-		res.Body.Close()
-		res, _ = client.PostForm(res.Request.URL.String(), form)
+	res := StartTest(client)
+	if res == nil {
+		return
 	}
-	log.Println(string(body))
-	log.Println("StatusCode:", res.StatusCode)
-	log.Println(res.Request.URL)
+	neededTokenTypes := map[atom.Atom]bool{
+		atom.Form:  true,
+		atom.Title: true,
+	}
+	for ; res.StatusCode == 200; {
+		body, _ := ioutil.ReadAll(res.Body)
+		err := res.Body.Close()
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		page := html.NewTokenizer(bytes.NewReader(body))
+		tag := NextTag(page, neededTokenTypes)
+		if tag.DataAtom == atom.Title {
+			_ = page.Next()
+			textToken := page.Token()
+			if textToken.Type == html.TextToken && textToken.Data == "Test successfully passed" {
+				log.Println(textToken.Data)
+				break
+			} else {
+				log.Println("Page \"" + textToken.Data + "\" visited")
+				tag = NextTag(page, map[atom.Atom]bool{atom.Form: true})
+			}
+		}
+		switch tag.DataAtom {
+		case atom.Form:
+			form := FormProcessor(page)
+			res, err = client.PostForm(res.Request.URL.String(), form)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+		}
+	}
 }
 
-func NextToken(page *html.Tokenizer) (tag html.Token) {
-	neededTokenTypes := map[atom.Atom]bool{
-		atom.Form:   true,
-		atom.Select: true,
-		atom.Option: true,
-		atom.Input:  true,
-		atom.Title:  true,
-		atom.A: true,
+func StartTest(client *http.Client) (res *http.Response) {
+	res, err := client.Get(startUrl)
+	if err != nil {
+		log.Println(err)
+		return
 	}
+	link := AttributesToMap(
+		NextTag(
+			html.NewTokenizer(res.Body),
+			map[atom.Atom]bool{atom.A: true},
+		),
+	)["href"]
+	if link == "" {
+		log.Println("Href attribute is empty")
+		return
+	}
+	res, err = client.Get(startUrl + link)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	return res
+}
+
+func NextTag(page *html.Tokenizer, neededTokenTypes map[atom.Atom]bool) (tag html.Token) {
 
 	for {
 		_ = page.Next()
 		token := page.Token()
 		if token.Type == html.ErrorToken {
 			if page.Err() != io.EOF {
-				log.Println("Ошибка парсинга тела http-ответа")
+				log.Println("Error on parsing response body")
 			}
 			return token
 		}
@@ -57,61 +101,54 @@ func NextToken(page *html.Tokenizer) (tag html.Token) {
 	}
 }
 
-func PageProcessor(body io.Reader) (form url.Values) {
-	page := html.NewTokenizer(body)
+func FormProcessor(page *html.Tokenizer) (form url.Values) {
 
+	neededTokenTypes := map[atom.Atom]bool{
+		atom.Select: true,
+		atom.Option: true,
+		atom.Input:  true,
+	}
 	form = make(url.Values)
 	var selectName string
 
 	for {
-		token := NextToken(page)
+		token := NextTag(page, neededTokenTypes)
 		if token.Type == html.ErrorToken {
 			break
 		}
-		/*if token.Type == html.TextToken {
-			text = fmt.Sprintf("%s%s", text, token.Data)
-		}*/
 		switch token.DataAtom {
 		case atom.Input:
-			name, inpType, value := InputProcessor(token)
-			if inpType == "text" {
-				form.Add(name, "test")
-			} else if inpType == "radio" {
-				radioValue, exists := form[name]
+			attributes := AttributesToMap(token)
+			switch attributes["type"] {
+			case "text":
+				form.Add(attributes["name"], "test")
+			case "radio":
+				value := attributes["value"]
+				radioValue, exists := form[attributes["name"]]
 				if !exists || len(radioValue[0]) < len(value) {
-					form.Set(name, value)
+					form.Set(attributes["name"], value)
 				}
 			}
 		case atom.Select:
-			selectName, _, _ = InputProcessor(token)
+			selectName = AttributesToMap(token)["name"]
 		case atom.Option:
-			_, _, value := InputProcessor(token)
+			value := AttributesToMap(token)["value"]
 			selectValue, exists := form[selectName]
 			if !exists || len(selectValue[0]) < len(value) {
 				form.Set(selectName, value)
 			}
-		case atom.Title:
-			_ = page.Next()
-			textToken := page.Token()
-			if textToken.Type == html.TextToken {
-				log.Println(textToken.Data)
-			}
-		case atom.A:
-			
 		}
 	}
 	return form
 }
 
-func InputProcessor(tag html.Token) (name, inpType, value string) {//пусть возвращает карту аттрибутов (ключ-значение)
-	for i := range tag.Attr {
-		if tag.Attr[i].Key == "type" {
-			inpType = strings.TrimSpace(tag.Attr[i].Val)
-		} else if tag.Attr[i].Key == "name" {
-			name = strings.TrimSpace(tag.Attr[i].Val)
-		} else if tag.Attr[i].Key == "value" {
-			value = strings.TrimSpace(tag.Attr[i].Val)
+func AttributesToMap(tag html.Token) map[string]string {
+	filter := map[string]bool{"type": true, "name": true, "value": true, "href": true}
+	attributes := make(map[string]string)
+	for _, v := range tag.Attr {
+		if filter[v.Key] {
+			attributes[v.Key] = v.Val
 		}
 	}
-	return name, inpType, value
+	return attributes
 }
